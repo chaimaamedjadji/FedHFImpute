@@ -1,61 +1,15 @@
-#!/usr/bin/env python3
-"""
-SOTA + Federated Imputation Baselines for FedHF-Impute datasets
-
-LOCAL (per-client) METHODS
--------------------------
-- MICE (IterativeImputer)
-- Denoising Autoencoder (DAE)
-- GAIN
-- Transformer-based Imputer (TabTransformer-style)
-
-FEDERATED METHODS (global model/statistics trained across clients)
------------------------------------------------------------------
-- Fed-Mean         : aggregate global feature means (raw-space), broadcast
-- Fed-DAE (FedAvg) : federated denoising autoencoder via FedAvg
-- Fed-Transformer  : federated transformer imputer via FedAvg
-
-DATA FORMAT (IMPORTANT)
-----------------------
-Each client file: client_k.npz
-  - X                  : (N_k, F) local data with NaNs
-  - availability_mask  : (F,) {0,1} (features available at this client)
-
-Global test file: test.npz
-  - X                  : (N_test, F)
-
-EVALUATION
-----------
-- For each client, we standardize using THAT CLIENT's train stats (mu,sigma)
-- We corrupt validation only on entries that are:
-    observed AND available
-- RMSE computed ONLY on corrupted entries
-
-NOTES
------
-- Fed-Mean is computed in RAW space across clients, then converted into each client's
-  standardized space during evaluation via: (global_raw_mean - client_mu) / client_sigma.
-- Federated deep models are trained on per-client standardized data with the same training
-  corruption scheme as the local variants.
-"""
-
 import argparse
 import glob
 import os
 import numpy as np
 import pandas as pd
-
 from sklearn.experimental import enable_iterative_imputer  # noqa
 from sklearn.impute import IterativeImputer
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-
-# =========================
 # Utilities
-# =========================
 
 def set_seed(seed: int):
     np.random.seed(seed)
@@ -108,18 +62,13 @@ def get_client_paths(clients_dir: str):
     return sorted(glob.glob(f"{clients_dir}/client_*.npz"))
 
 def weighted_fedavg(state_dicts, weights):
-    """Weighted average of PyTorch state_dicts (CPU tensors expected)."""
     out = {}
     total = float(np.sum(weights)) if np.sum(weights) > 0 else 1.0
-    keys = state_dicts[0].keys()
-    for k in keys:
+    for k in state_dicts[0].keys():
         out[k] = sum(sd[k] * (w / total) for sd, w in zip(state_dicts, weights))
     return out
 
-
-# =========================
 # MICE (Local)
-# =========================
 
 def impute_mice(Xtr, Xva_in, seed):
     keep = ~np.all(np.isnan(Xtr), axis=0)
@@ -134,10 +83,7 @@ def impute_mice(Xtr, Xva_in, seed):
     pred[:, keep] = imp.transform(Xva_in[:, keep])
     return pred
 
-
-# =========================
 # DAE (Local + Federated)
-# =========================
 
 class DAE(nn.Module):
     def __init__(self, F, hidden=256):
@@ -196,9 +142,7 @@ def predict_dae(model, X, device):
     ).cpu().numpy()
 
 
-# =========================
 # GAIN (Local)
-# =========================
 
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -237,14 +181,12 @@ def train_gain_local(Xtr, a, seed, device):
 
         mb_eff = mb * (ab[None, :] > 0.5)
 
-        # ===== Generator forward =====
         z = torch.rand_like(xb)
         x_tilde = xb * mb_eff + z * (1 - mb_eff)
 
         G_out = G(torch.cat([x_tilde, mb_eff], dim=-1))
         x_hat = xb * mb_eff + G_out * (1 - mb_eff)
 
-        # ===== Discriminator step =====
         hint = (torch.rand_like(mb_eff) < 0.9).float() * mb_eff
         D_in = torch.cat([x_hat.detach(), hint], dim=-1)
         D_out = D(D_in)
@@ -255,7 +197,6 @@ def train_gain_local(Xtr, a, seed, device):
         d_loss.backward()
         optD.step()
 
-        # ===== Generator step (recompute D output!) =====
         D_in_G = torch.cat([x_hat, hint], dim=-1)
         D_out_G = D(D_in_G)
 
@@ -283,10 +224,7 @@ def predict_gain(G, X, a, device):
     inp = np.concatenate([x_tilde, mb_eff], axis=-1)  # (N, 2F)
     return G(torch.from_numpy(inp).to(device)).cpu().numpy()
 
-
-# =========================
 # Transformer Imputer (Local + Federated)
-# =========================
 
 class TransformerImputer(nn.Module):
     def __init__(self, F, d=128):
@@ -348,13 +286,9 @@ def predict_transformer(model, X, a, device):
         torch.from_numpy(a.astype(np.float32)).to(device)
     ).cpu().numpy()
 
-
-# =========================
-# Fed-Mean (Global stats)
-# =========================
+# Fed-Mean (Global stats in RAW space)
 
 def fit_fed_mean_raw(clients_paths):
-    """Compute global feature mean in RAW space over (observed & available) entries."""
     sumv = None
     cntv = None
 
@@ -387,9 +321,6 @@ def predict_fed_mean_in_client_zspace(mu_raw_global, client_mu_raw, client_sigma
     pred = np.where(miss, mu_z[None, :], pred)
     return pred
 
-# =========================
-# Federated training loops (FedAvg)
-# =========================
 
 def fed_train_dae(clients_paths, seed, device, rounds=20, local_epochs=1, lr=1e-3):
     set_seed(seed)
@@ -402,12 +333,11 @@ def fed_train_dae(clients_paths, seed, device, rounds=20, local_epochs=1, lr=1e-
         local_states = []
         weights = []
 
-        for cid, p in enumerate(clients_paths):
+        for p in clients_paths:
             d = load_npz(p)
             Xtr_raw = d["X"].astype(np.float32)
             a = d["availability_mask"].astype(np.float32)
 
-            # local z-space (per client)
             mu, sigma = standardize_fit(Xtr_raw)
             Xtr = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
 
@@ -457,7 +387,7 @@ def fed_train_transformer(clients_paths, seed, device, rounds=20, local_epochs=1
         local_states = []
         weights = []
 
-        for cid, p in enumerate(clients_paths):
+        for p in clients_paths:
             d = load_npz(p)
             Xtr_raw = d["X"].astype(np.float32)
             a = d["availability_mask"].astype(np.float32)
@@ -501,9 +431,7 @@ def fed_train_transformer(clients_paths, seed, device, rounds=20, local_epochs=1
     return global_model
 
 
-# =========================
-# Runners
-# =========================
+# Simulation
 
 def run_one_client_local(client_npz, test_npz, methods, p, seed, device):
     d = load_npz(client_npz)
@@ -538,7 +466,6 @@ def run_federated(clients_dir, test_npz, fed_methods, p, seed, device, rounds=20
     clients_paths = get_client_paths(clients_dir)
     Xt_raw = load_npz(test_npz)["X"]
 
-    # Train global models/stats once
     fed_models = {}
     mu_raw_global = None
 
@@ -555,7 +482,6 @@ def run_federated(clients_dir, test_npz, fed_methods, p, seed, device, rounds=20
             clients_paths, seed=seed, device=device, rounds=rounds, local_epochs=local_epochs
         )
 
-    # Evaluate per client (using that client's mu/sigma)
     rows = []
     for cid, cp in enumerate(clients_paths):
         d = load_npz(cp)
@@ -563,7 +489,7 @@ def run_federated(clients_dir, test_npz, fed_methods, p, seed, device, rounds=20
         a = d["availability_mask"]
 
         client_mu, client_sigma = standardize_fit(Xtr_raw)
-        Xt = standardize_apply(Xt_raw, client_mu, client_sigma)
+        Xt = standardize_apply(Xt_raw, client_mu, client_sigma)  # scaled space
 
         Xt_in, mask = corrupt_validation(Xt, a, p, seed + cid)
 
@@ -582,7 +508,7 @@ def run_federated(clients_dir, test_npz, fed_methods, p, seed, device, rounds=20
             rows.append({
                 "client_id": cid,
                 "method": m,
-                "rmse": rmse_on_mask(Xt, pred, mask),
+                "rmse_scaled": rmse_on_mask(Xt, pred, mask),
             })
 
     return rows
@@ -602,10 +528,8 @@ def main():
 
     ap.add_argument("--corruption-prob", type=float, default=0.6)
     ap.add_argument("--seed", type=int, default=123)
-
     ap.add_argument("--device", default="cpu")
 
-    # Federated training knobs
     ap.add_argument("--fed-rounds", type=int, default=20)
     ap.add_argument("--fed-local-epochs", type=int, default=1)
 
@@ -623,18 +547,20 @@ def main():
     for cid, pth in enumerate(client_paths):
         if len(local_methods) == 0:
             break
-        for name, rmse in run_one_client_local(
+
+        results = run_one_client_local(
             pth, args.test_npz, local_methods, args.corruption_prob, args.seed + cid, device
-        ):
+        )
+        for name, rmse_scaled in results:
             rows.append({
                 "client_id": cid,
                 "method": name,
-                "rmse": rmse,
+                "rmse_scaled": rmse_scaled,
             })
 
     # ----- Federated baselines -----
     if len(fed_methods) > 0:
-        fed_rows = run_federated(
+        rows.extend(run_federated(
             clients_dir=args.clients_dir,
             test_npz=args.test_npz,
             fed_methods=fed_methods,
@@ -643,14 +569,13 @@ def main():
             device=device,
             rounds=args.fed_rounds,
             local_epochs=args.fed_local_epochs,
-        )
-        rows.extend(fed_rows)
+        ))
 
     df = pd.DataFrame(rows)
     ensure_dir(args.out_csv)
     df.to_csv(args.out_csv, index=False)
 
-    print(df.groupby("method")["rmse"].agg(["mean", "std", "count"]).sort_values("mean"))
+    print(df.groupby("method")["rmse_scaled"].agg(["mean", "std", "count"]).sort_values("mean"))
 
 if __name__ == "__main__":
     main()
