@@ -13,22 +13,14 @@ def make_client(
     seed: int = 123,
 ):
     rng = np.random.default_rng(seed + client_id)
-
-    # Availability mask: which global features exist on this client
     avail = np.zeros(n_features_global, dtype=np.float32)
     keep = rng.choice(n_features_global, size=int(n_features_global * feature_keep_ratio), replace=False)
     avail[keep] = 1.0
-
-    # Latent-factor correlated data
     Z = rng.normal(size=(n_samples, latent_dim)).astype(np.float32)
     W = (rng.normal(size=(latent_dim, n_features_global)).astype(np.float32) * 0.8)
     X_full = (Z @ W + rng.normal(size=(n_samples, n_features_global)).astype(np.float32) * 0.25)
-
-    # Features not available => NaN always
     X = X_full.copy()
     X[:, avail == 0] = np.nan
-
-    # Random missingness on available features
     miss = rng.uniform(size=X.shape) < missing_prob
     miss[:, avail == 0] = True
     X[miss] = np.nan

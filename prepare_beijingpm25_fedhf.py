@@ -1,11 +1,3 @@
-# prepare_beijingpm25_fedhf.py
-# ------------------------------------------------------------
-# UCI Beijing PM2.5 dataset (PRSA_data_2010.1.1-2014.12.31.csv)
-# Missing values are denoted as "NA". :contentReference[oaicite:5]{index=5}
-#
-# Creates FL clients with heterogeneous schemas + global corr graph.
-# ------------------------------------------------------------
-
 from __future__ import annotations
 import os, argparse, urllib.request
 import numpy as np
@@ -111,26 +103,20 @@ def main():
         raise RuntimeError("Missing csv. Download manually then run --offline.")
 
     df = pd.read_csv(csv_path, na_values=["NA", "NaN", ""])
-    # Drop id/time columns (keep meteorology)
     drop_cols = [c for c in ["No", "year", "month", "day", "hour", "cbwd"] if c in df.columns]
     df = df.drop(columns=drop_cols, errors="ignore")
 
-    # Convert to numeric
     df = df.apply(pd.to_numeric, errors="coerce")
     X = df.to_numpy(dtype=np.float32)
-
-    # Train/test split by time (first 80% train, last 20% test)
     N = X.shape[0]
     split = int(0.8 * N)
     Xtr, Xte = X[:split], X[split:]
     obs_tr = ~np.isnan(Xtr)
     obs_te = ~np.isnan(Xte)
 
-    # Standardize using train
     Xtr_std, mu, sd = zscore_train(Xtr, obs_tr)
     Xte_std = ((Xte - mu[None, :]) / sd[None, :]).astype(np.float32)
 
-    # Graph
     edge_index, edge_weight = build_corr_graph(Xtr_std, obs_tr, k=args.graph_k, min_abs_corr=args.min_abs_corr)
 
     np.savez_compressed(
@@ -141,7 +127,6 @@ def main():
         sd=sd,
     )
 
-    # Clients = contiguous time chunks
     clients = make_clients_time_split(Xtr_std, args.n_clients, args.keep_ratio, args.seed)
     for cid, Xi, avail in clients:
         np.savez_compressed(

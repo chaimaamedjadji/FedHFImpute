@@ -1,12 +1,3 @@
-# prepare_airquality_fedhf.py
-# ------------------------------------------------------------
-# UCI Air Quality dataset (AirQualityUCI.zip)
-# Missing values are tagged with -200. :contentReference[oaicite:3]{index=3}
-#
-# Creates FL clients with heterogeneous schemas + global corr graph.
-# Output format matches your SECOM pipeline.
-# ------------------------------------------------------------
-
 from __future__ import annotations
 import os, argparse, urllib.request, zipfile
 import numpy as np
@@ -111,25 +102,18 @@ def main():
         raise RuntimeError("Missing zip. Download manually then run --offline.")
 
     with zipfile.ZipFile(zip_path, "r") as z:
-        # file inside zip is typically 'AirQualityUCI.csv'
         name = [n for n in z.namelist() if n.lower().endswith(".csv")][0]
         with z.open(name) as f:
             df = pd.read_csv(f, sep=";", decimal=",")
 
-    # Drop empty last columns (common in this dataset)
     df = df.dropna(axis=1, how="all")
-
-    # Remove Date/Time
     for c in ["Date", "Time"]:
         if c in df.columns:
             df = df.drop(columns=[c])
 
-    # Convert to numeric; missing is -200
     df = df.apply(pd.to_numeric, errors="coerce")
     X = df.to_numpy(dtype=np.float32).copy()
     X[X == -200.0] = np.nan
-
-    # Train/test split
     rng = np.random.default_rng(args.seed)
     N = X.shape[0]
     perm = rng.permutation(N)
@@ -139,11 +123,9 @@ def main():
     obs_tr = ~np.isnan(Xtr)
     obs_te = ~np.isnan(Xte)
 
-    # Standardize using train
     Xtr_std, mu, sd = zscore_train(Xtr, obs_tr)
     Xte_std = ((Xte - mu[None, :]) / sd[None, :]).astype(np.float32)
 
-    # Graph
     edge_index, edge_weight = build_corr_graph(Xtr_std, obs_tr, k=args.graph_k, min_abs_corr=args.min_abs_corr)
 
     np.savez_compressed(
@@ -154,7 +136,6 @@ def main():
         sd=sd,
     )
 
-    # Clients
     clients = make_clients(Xtr_std, args.n_clients, args.keep_ratio, args.seed)
     for cid, Xi, avail in clients:
         np.savez_compressed(

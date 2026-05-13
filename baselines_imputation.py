@@ -1,16 +1,35 @@
+"""
+Baselines for imputation under heterogeneous feature availability:
+- Local: mice, vfl_knn, dae, gain, transformer
+- Federated: fed_mean, fed_dae, fed_transformer, fed_featgen
+
+Evaluation consistency:
+- RMSE is computed in RAW space on the corrupted mask only.
+
+python baselines_imputation.py \
+  --clients-dir path/to/clients \
+  --test-npz path/to/test.npz \
+  --out-csv results/out.csv \
+  --methods mice,vfl_knn,dae,gain,transformer,fed_mean,fed_dae,fed_transformer,fed_featgen \
+  --corruption-prob 0.6 \
+  --seed 123 \
+  --device cpu \
+  --fed-rounds 20 \
+  --fed-local-epochs 1
+"""
+
 import argparse
 import glob
 import os
 import numpy as np
 import pandas as pd
-from sklearn.experimental import enable_iterative_imputer  # noqa
-from sklearn.impute import IterativeImputer
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer, KNNImputer
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Utilities
-
+# Utilities functions
 def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -33,29 +52,44 @@ def nan_to_num(X: np.ndarray, val: float = 0.0):
     Y[np.isnan(Y)] = val
     return Y
 
-def standardize_fit(X: np.ndarray):
-    mu = np.nanmean(X, axis=0)
-    sigma = np.nanstd(X, axis=0)
+def standardize_fit(X_raw: np.ndarray):
+    mu = np.nanmean(X_raw, axis=0)
+    sigma = np.nanstd(X_raw, axis=0)
     sigma[sigma < 1e-6] = 1.0
     return mu.astype(np.float32), sigma.astype(np.float32)
 
-def standardize_apply(X: np.ndarray, mu: np.ndarray, sigma: np.ndarray):
-    return (X - mu[None, :]) / sigma[None, :]
+def standardize_apply(X_raw: np.ndarray, mu: np.ndarray, sigma: np.ndarray):
+    return (X_raw - mu[None, :]) / sigma[None, :]
 
-def corrupt_validation(X: np.ndarray, a: np.ndarray, p: float, seed: int):
+def standardize_invert(Z: np.ndarray, mu: np.ndarray, sigma: np.ndarray):
+    return Z * sigma[None, :] + mu[None, :]
+
+def finalize_imputation(X_in_raw: np.ndarray, X_pred_raw: np.ndarray):
+    """
+    It keeps the observed entries from X_in_raw and fill NaNs with X_pred_raw.
+    """
+    out = X_in_raw.copy()
+    miss = np.isnan(out)
+    out[miss] = X_pred_raw[miss]
+    return out
+
+def corrupt_validation(X_raw: np.ndarray, a: np.ndarray, p: float, seed: int, train_obs_cols: np.ndarray = None):
     rng = np.random.RandomState(seed)
-    m = ~np.isnan(X)
+    m_test = ~np.isnan(X_raw)
     a = a.astype(bool)
+    eligible = m_test & a[None, :]
+    # only corrupt columns that have at least one observed value in this client's TRAIN split
+    if train_obs_cols is not None:
+        eligible = eligible & train_obs_cols[None, :]
 
-    eligible = m & a[None, :]
-    mask = (rng.rand(*X.shape) < p) & eligible
-
-    X_in = X.copy()
+    mask = (rng.rand(*X_raw.shape) < p) & eligible
+    X_in = X_raw.copy()
     X_in[mask] = np.nan
     return X_in, mask
 
 def rmse_on_mask(x_true: np.ndarray, x_pred: np.ndarray, mask: np.ndarray):
     diff = (x_pred - x_true)[mask]
+    diff = diff[~np.isnan(diff)]
     return float(np.sqrt(np.mean(diff ** 2))) if diff.size > 0 else float("nan")
 
 def get_client_paths(clients_dir: str):
@@ -68,22 +102,76 @@ def weighted_fedavg(state_dicts, weights):
         out[k] = sum(sd[k] * (w / total) for sd, w in zip(state_dicts, weights))
     return out
 
-# MICE (Local)
 
-def impute_mice(Xtr, Xva_in, seed):
-    keep = ~np.all(np.isnan(Xtr), axis=0)
-    imp = IterativeImputer(
-        max_iter=10,
-        random_state=seed,
-        initial_strategy="mean",
-        sample_posterior=False,
-    )
-    imp.fit(Xtr[:, keep])
-    pred = np.zeros_like(Xva_in)
-    pred[:, keep] = imp.transform(Xva_in[:, keep])
+
+# Local baselines (MICE, VFL-KNN)
+
+def impute_mice(Xtr_raw, Xt_in_raw, a, seed):
+    Xtr_raw = Xtr_raw.astype(np.float32)
+    Xt_in_raw = Xt_in_raw.astype(np.float32)
+    a = a.astype(bool)
+    pred = Xt_in_raw.copy()
+    F = pred.shape[1]
+    fb = np.nanmean(Xtr_raw, axis=0).astype(np.float32)  # (F,)
+    fb[np.isnan(fb)] = 0.0
+    cols = np.where(a)[0]
+    if cols.size == 0:
+        # fill any missing values
+        miss = np.isnan(pred)
+        pred[miss] = np.broadcast_to(fb, pred.shape)[miss]
+        return pred
+    # fit MICE only on columns that have some training signal
+    keep = ~np.all(np.isnan(Xtr_raw[:, cols]), axis=0)
+    cols_keep = cols[keep]
+    if cols_keep.size > 0:
+        imp = IterativeImputer(
+            max_iter=10,
+            random_state=seed,
+            initial_strategy="mean",
+            sample_posterior=False,
+        )
+        imp.fit(Xtr_raw[:, cols_keep])
+        Xt_imp = imp.transform(Xt_in_raw[:, cols_keep])
+        miss = np.isnan(pred[:, cols_keep])
+        pred[:, cols_keep][miss] = Xt_imp[miss]
+
+    # final hard fill
+    miss = np.isnan(pred)
+    miss &= a[None, :]
+    if miss.any():
+        fb_mat = np.broadcast_to(fb, pred.shape)
+        pred[miss] = fb_mat[miss]
     return pred
 
-# DAE (Local + Federated)
+def impute_vfl_knn(Xtr_raw, Xt_in_raw, a, n_neighbors=5, weights="distance"):
+    Xtr_raw = Xtr_raw.astype(np.float32)
+    Xt_in_raw = Xt_in_raw.astype(np.float32)
+    a = a.astype(bool)
+    pred = Xt_in_raw.copy()
+    F = pred.shape[1]
+    fb = np.nanmean(Xtr_raw, axis=0).astype(np.float32)
+    fb[np.isnan(fb)] = 0.0
+    cols = np.where(a)[0]
+    if cols.size > 0:
+        keep = ~np.all(np.isnan(Xtr_raw[:, cols]), axis=0)
+        cols_keep = cols[keep]
+        if cols_keep.size > 0:
+            imp = KNNImputer(n_neighbors=n_neighbors, weights=weights)
+            imp.fit(Xtr_raw[:, cols_keep])
+            Xt_imp = imp.transform(Xt_in_raw[:, cols_keep])
+            miss = np.isnan(pred[:, cols_keep])
+            pred[:, cols_keep][miss] = Xt_imp[miss]
+    # final hard fill
+    miss = np.isnan(pred)
+    miss &= a[None, :]
+    if miss.any():
+        fb_mat = np.broadcast_to(fb, pred.shape)
+        pred[miss] = fb_mat[miss]
+    return pred
+
+
+
+# DAE (Local & Federated)
 
 class DAE(nn.Module):
     def __init__(self, F, hidden=256):
@@ -99,47 +187,39 @@ class DAE(nn.Module):
     def forward(self, x, m):
         return self.net(torch.cat([x, m], dim=-1))
 
-def train_dae_local(Xtr, a, seed, device):
+def train_dae_local(Xtr_z, a, seed, device):
     set_seed(seed)
-    Xtr = Xtr.astype(np.float32)
-    m = obs_mask(Xtr)
-    x0 = nan_to_num(Xtr)
-
-    F = Xtr.shape[1]
+    Xtr_z = Xtr_z.astype(np.float32)
+    m = obs_mask(Xtr_z)
+    x0 = nan_to_num(Xtr_z)
+    F = Xtr_z.shape[1]
     a = a.astype(np.float32)
-
     model = DAE(F).to(device)
     opt = optim.Adam(model.parameters(), lr=1e-3)
-
     for _ in range(80):
         xb = torch.from_numpy(x0).to(device)
         mb = torch.from_numpy(m).to(device)
         ab = torch.from_numpy(a).to(device)
-
         eligible = (mb > 0.5) & (ab[None, :] > 0.5)
         Omega = (torch.rand_like(xb) < 0.3) & eligible
-
         x_in = xb.clone()
         m_in = mb.clone()
         x_in[Omega] = 0.0
         m_in[Omega] = 0.0
-
         pred = model(x_in, m_in)
         loss = ((pred - xb) ** 2)[Omega].mean()
-
         opt.zero_grad()
         loss.backward()
         opt.step()
-
     return model
-
 @torch.no_grad()
-def predict_dae(model, X, device):
-    X = X.astype(np.float32)
+def predict_dae(model, X_z, device):
+    X_z = X_z.astype(np.float32)
     return model(
-        torch.from_numpy(nan_to_num(X)).to(device),
-        torch.from_numpy(obs_mask(X)).to(device)
+        torch.from_numpy(nan_to_num(X_z)).to(device),
+        torch.from_numpy(obs_mask(X_z)).to(device)
     ).cpu().numpy()
+
 
 
 # GAIN (Local)
@@ -158,13 +238,13 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def train_gain_local(Xtr, a, seed, device):
+def train_gain_local(Xtr_z, a, seed, device):
     set_seed(seed)
-    Xtr = Xtr.astype(np.float32)
-    m = obs_mask(Xtr)
-    x0 = nan_to_num(Xtr)
+    Xtr_z = Xtr_z.astype(np.float32)
+    m = obs_mask(Xtr_z)
+    x0 = nan_to_num(Xtr_z)
 
-    F = Xtr.shape[1]
+    F = Xtr_z.shape[1]
     a = a.astype(np.float32)
 
     G = MLP(2 * F, F).to(device)
@@ -211,20 +291,29 @@ def train_gain_local(Xtr, a, seed, device):
     return G
 
 @torch.no_grad()
-def predict_gain(G, X, a, device):
-    X = X.astype(np.float32)
-    mb = obs_mask(X)
-    xb = nan_to_num(X)
+def predict_gain(G, X_z, a, device):
+    """
+    Returns x_hat (imputed matrix) in z-space.
+    """
+    X_z = X_z.astype(np.float32)
+    mb = obs_mask(X_z)
+    xb = nan_to_num(X_z)
     ab = a.astype(np.float32)
 
     mb_eff = mb * (ab[None, :] > 0.5)
     z = np.random.rand(*xb.shape).astype(np.float32)
     x_tilde = xb * mb_eff + z * (1 - mb_eff)
 
-    inp = np.concatenate([x_tilde, mb_eff], axis=-1)  # (N, 2F)
-    return G(torch.from_numpy(inp).to(device)).cpu().numpy()
+    inp = np.concatenate([x_tilde, mb_eff], axis=-1)
+    G_out = G(torch.from_numpy(inp).to(device)).cpu().numpy()
 
+    x_hat = xb * mb_eff + G_out * (1 - mb_eff)
+    return x_hat
+
+
+# -------------------------
 # Transformer Imputer (Local + Federated)
+# -------------------------
 
 class TransformerImputer(nn.Module):
     def __init__(self, F, d=128):
@@ -244,13 +333,13 @@ class TransformerImputer(nn.Module):
         h = self.tr(e + v + f)
         return self.out(h).squeeze(-1)
 
-def train_transformer_local(Xtr, a, seed, device):
+def train_transformer_local(Xtr_z, a, seed, device):
     set_seed(seed)
-    Xtr = Xtr.astype(np.float32)
-    m = obs_mask(Xtr)
-    x0 = nan_to_num(Xtr)
+    Xtr_z = Xtr_z.astype(np.float32)
+    m = obs_mask(Xtr_z)
+    x0 = nan_to_num(Xtr_z)
 
-    F = Xtr.shape[1]
+    F = Xtr_z.shape[1]
     a = a.astype(np.float32)
 
     model = TransformerImputer(F).to(device)
@@ -279,14 +368,17 @@ def train_transformer_local(Xtr, a, seed, device):
     return model
 
 @torch.no_grad()
-def predict_transformer(model, X, a, device):
+def predict_transformer(model, X_z, a, device):
     return model(
-        torch.from_numpy(nan_to_num(X)).to(device),
-        torch.from_numpy(obs_mask(X)).to(device),
+        torch.from_numpy(nan_to_num(X_z)).to(device),
+        torch.from_numpy(obs_mask(X_z)).to(device),
         torch.from_numpy(a.astype(np.float32)).to(device)
     ).cpu().numpy()
 
+
+# -------------------------
 # Fed-Mean (Global stats in RAW space)
+# -------------------------
 
 def fit_fed_mean_raw(clients_paths):
     sumv = None
@@ -314,13 +406,20 @@ def fit_fed_mean_raw(clients_paths):
     mu_raw = (sumv / np.maximum(cntv, 1.0)).astype(np.float32)
     return mu_raw
 
-def predict_fed_mean_in_client_zspace(mu_raw_global, client_mu_raw, client_sigma_raw, Xt_in_z):
-    mu_z = (mu_raw_global - client_mu_raw) / client_sigma_raw  # (F,)
-    pred = nan_to_num(Xt_in_z).copy()
-    miss = np.isnan(Xt_in_z)
-    pred = np.where(miss, mu_z[None, :], pred)
+def predict_fed_mean_raw(mu_raw_global, Xt_in_raw):
+    """
+    Correct broadcasting under boolean mask.
+    """
+    pred = Xt_in_raw.copy()
+    miss = np.isnan(pred)  # (N, F)
+    mu_mat = np.broadcast_to(mu_raw_global, pred.shape)  # (N, F)
+    pred[miss] = mu_mat[miss]
     return pred
 
+
+# -------------------------
+# Federated training: DAE / Transformer
+# -------------------------
 
 def fed_train_dae(clients_paths, seed, device, rounds=20, local_epochs=1, lr=1e-3):
     set_seed(seed)
@@ -339,10 +438,10 @@ def fed_train_dae(clients_paths, seed, device, rounds=20, local_epochs=1, lr=1e-
             a = d["availability_mask"].astype(np.float32)
 
             mu, sigma = standardize_fit(Xtr_raw)
-            Xtr = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
+            Xtr_z = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
 
-            m = obs_mask(Xtr)
-            x0 = nan_to_num(Xtr)
+            m = obs_mask(Xtr_z)
+            x0 = nan_to_num(Xtr_z)
 
             local_model = DAE(F).to(device)
             local_model.load_state_dict(global_model.state_dict())
@@ -393,10 +492,10 @@ def fed_train_transformer(clients_paths, seed, device, rounds=20, local_epochs=1
             a = d["availability_mask"].astype(np.float32)
 
             mu, sigma = standardize_fit(Xtr_raw)
-            Xtr = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
+            Xtr_z = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
 
-            m = obs_mask(Xtr)
-            x0 = nan_to_num(Xtr)
+            m = obs_mask(Xtr_z)
+            x0 = nan_to_num(Xtr_z)
 
             local_model = TransformerImputer(F).to(device)
             local_model.load_state_dict(global_model.state_dict())
@@ -431,40 +530,153 @@ def fed_train_transformer(clients_paths, seed, device, rounds=20, local_epochs=1
     return global_model
 
 
-# Simulation
+# -------------------------
+# FedFeatGen (Federated Feature Generator baseline)
+# -------------------------
+
+class FeatGenNet(nn.Module):
+    """
+    Feature generator / translator style baseline:
+    masked reconstruction autoencoder with bottleneck.
+    """
+    def __init__(self, F, hidden=256, bottleneck=64):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Linear(2 * F, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, bottleneck),
+            nn.ReLU(),
+        )
+        self.dec = nn.Sequential(
+            nn.Linear(bottleneck, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, F),
+        )
+
+    def forward(self, x, m):
+        z = self.enc(torch.cat([x, m], dim=-1))
+        return self.dec(z)
+
+def fed_train_featgen(clients_paths, seed, device, rounds=20, local_epochs=1, lr=1e-3,
+                      hidden=256, bottleneck=64):
+    set_seed(seed)
+
+    d0 = load_npz(clients_paths[0])
+    F = d0["X"].shape[1]
+    global_model = FeatGenNet(F, hidden=hidden, bottleneck=bottleneck).to(device)
+
+    for _ in range(rounds):
+        local_states = []
+        weights = []
+
+        for p in clients_paths:
+            d = load_npz(p)
+            Xtr_raw = d["X"].astype(np.float32)
+            a = d["availability_mask"].astype(np.float32)
+
+            mu, sigma = standardize_fit(Xtr_raw)
+            Xtr_z = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
+
+            m = obs_mask(Xtr_z)
+            x0 = nan_to_num(Xtr_z)
+
+            local_model = FeatGenNet(F, hidden=hidden, bottleneck=bottleneck).to(device)
+            local_model.load_state_dict(global_model.state_dict())
+            opt = optim.Adam(local_model.parameters(), lr=lr)
+
+            for _e in range(local_epochs):
+                xb = torch.from_numpy(x0).to(device)
+                mb = torch.from_numpy(m).to(device)
+                ab = torch.from_numpy(a).to(device)
+
+                eligible = (mb > 0.5) & (ab[None, :] > 0.5)
+                Omega = (torch.rand_like(xb) < 0.3) & eligible
+
+                x_in = xb.clone()
+                m_in = mb.clone()
+                x_in[Omega] = 0.0
+                m_in[Omega] = 0.0
+
+                pred = local_model(x_in, m_in)
+                loss = ((pred - xb) ** 2)[Omega].mean()
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+            local_states.append({k: v.detach().cpu() for k, v in local_model.state_dict().items()})
+            weights.append(Xtr_raw.shape[0])
+
+        new_state = weighted_fedavg(local_states, weights)
+        global_model.load_state_dict({k: v.to(device) for k, v in new_state.items()})
+
+    return global_model
+
+@torch.no_grad()
+def predict_featgen(model, X_z, device):
+    X_z = X_z.astype(np.float32)
+    return model(
+        torch.from_numpy(nan_to_num(X_z)).to(device),
+        torch.from_numpy(obs_mask(X_z)).to(device)
+    ).cpu().numpy()
+
+
+# -------------------------
+# Simulation / Evaluation (RAW RMSE)
+# -------------------------
 
 def run_one_client_local(client_npz, test_npz, methods, p, seed, device):
     d = load_npz(client_npz)
-    Xtr_raw = d["X"]
+    Xtr_raw = d["X"].astype(np.float32)
     a = d["availability_mask"]
 
-    Xt_raw = load_npz(test_npz)["X"]
+    Xt_raw = load_npz(test_npz)["X"].astype(np.float32)
+    train_counts = np.sum(~np.isnan(Xtr_raw), axis=0)  # (F,)
+    train_good = train_counts >= 20
 
-    # client-specific standardization
+    Xt_in_raw, mask = corrupt_validation(Xt_raw, a, p, seed, train_obs_cols=train_good)
+    #Xt_in_raw, mask = corrupt_validation(Xt_raw, a, p, seed, train_obs_cols=train_obs_cols)
+    # Corrupt RAW test consistently
+    #Xt_in_raw, mask = corrupt_validation(Xt_raw, a, p, seed)
+
+    # Client-specific standardization (for NN methods)
     mu, sigma = standardize_fit(Xtr_raw)
-    Xtr = standardize_apply(Xtr_raw, mu, sigma)
-    Xt = standardize_apply(Xt_raw, mu, sigma)
-
-    Xt_in, mask = corrupt_validation(Xt, a, p, seed)
+    Xtr_z = standardize_apply(Xtr_raw, mu, sigma).astype(np.float32)
+    Xt_in_z = standardize_apply(Xt_in_raw, mu, sigma).astype(np.float32)
 
     out = []
     for m in methods:
         if m == "mice":
-            pred = impute_mice(Xtr, Xt_in, seed)
+            pred_raw = impute_mice(Xtr_raw, Xt_in_raw, a, seed)
+
+        elif m == "vfl_knn":
+            pred_raw = impute_vfl_knn(Xtr_raw, Xt_in_raw, a, n_neighbors=5)
+
         elif m == "dae":
-            pred = predict_dae(train_dae_local(Xtr, a, seed, device), Xt_in, device)
+            model = train_dae_local(Xtr_z, a, seed, device)
+            pred_z = predict_dae(model, Xt_in_z, device)
+            pred_raw = finalize_imputation(Xt_in_raw, standardize_invert(pred_z, mu, sigma))
+
         elif m == "gain":
-            pred = predict_gain(train_gain_local(Xtr, a, seed, device), Xt_in, a, device)
+            G = train_gain_local(Xtr_z, a, seed, device)
+            pred_z_full = predict_gain(G, Xt_in_z, a, device)  # full imputed in z-space
+            pred_raw = finalize_imputation(Xt_in_raw, standardize_invert(pred_z_full, mu, sigma))
+
         elif m == "transformer":
-            pred = predict_transformer(train_transformer_local(Xtr, a, seed, device), Xt_in, a, device)
+            model = train_transformer_local(Xtr_z, a, seed, device)
+            pred_z = predict_transformer(model, Xt_in_z, a, device)
+            pred_raw = finalize_imputation(Xt_in_raw, standardize_invert(pred_z, mu, sigma))
+
         else:
             raise ValueError(f"Unknown local method: {m}")
-        out.append((m, rmse_on_mask(Xt, pred, mask)))
+
+        out.append((m, rmse_on_mask(Xt_raw, pred_raw, mask)))
+
     return out
 
 def run_federated(clients_dir, test_npz, fed_methods, p, seed, device, rounds=20, local_epochs=1):
     clients_paths = get_client_paths(clients_dir)
-    Xt_raw = load_npz(test_npz)["X"]
+    Xt_raw = load_npz(test_npz)["X"].astype(np.float32)
 
     fed_models = {}
     mu_raw_global = None
@@ -482,37 +694,58 @@ def run_federated(clients_dir, test_npz, fed_methods, p, seed, device, rounds=20
             clients_paths, seed=seed, device=device, rounds=rounds, local_epochs=local_epochs
         )
 
+    if "fed_featgen" in fed_methods:
+        fed_models["fed_featgen"] = fed_train_featgen(
+            clients_paths, seed=seed, device=device, rounds=rounds, local_epochs=local_epochs
+        )
+
     rows = []
     for cid, cp in enumerate(clients_paths):
         d = load_npz(cp)
-        Xtr_raw = d["X"]
+        Xtr_raw = d["X"].astype(np.float32)
         a = d["availability_mask"]
+        train_counts = np.sum(~np.isnan(Xtr_raw), axis=0)  # (F,)
+        train_good = train_counts >= 20
 
+        Xt_in_raw, mask = corrupt_validation(Xt_raw, a, p, seed, train_obs_cols=train_good)
+        # Corrupt RAW test consistently
+        #Xt_in_raw, mask = corrupt_validation(Xt_raw, a, p, seed + cid)
+
+        # Client-specific standardization for NN inference
         client_mu, client_sigma = standardize_fit(Xtr_raw)
-        Xt = standardize_apply(Xt_raw, client_mu, client_sigma)  # scaled space
-
-        Xt_in, mask = corrupt_validation(Xt, a, p, seed + cid)
+        Xt_in_z = standardize_apply(Xt_in_raw, client_mu, client_sigma).astype(np.float32)
 
         for m in fed_methods:
             if m == "fed_mean":
-                pred = predict_fed_mean_in_client_zspace(
-                    mu_raw_global, client_mu, client_sigma, Xt_in
-                )
+                pred_raw = predict_fed_mean_raw(mu_raw_global, Xt_in_raw)
+
             elif m == "fed_dae":
-                pred = predict_dae(fed_models["fed_dae"], Xt_in, device)
+                pred_z = predict_dae(fed_models["fed_dae"], Xt_in_z, device)
+                pred_raw = finalize_imputation(Xt_in_raw, standardize_invert(pred_z, client_mu, client_sigma))
+
             elif m == "fed_transformer":
-                pred = predict_transformer(fed_models["fed_transformer"], Xt_in, a, device)
+                pred_z = predict_transformer(fed_models["fed_transformer"], Xt_in_z, a, device)
+                pred_raw = finalize_imputation(Xt_in_raw, standardize_invert(pred_z, client_mu, client_sigma))
+
+            elif m == "fed_featgen":
+                pred_z = predict_featgen(fed_models["fed_featgen"], Xt_in_z, device)
+                pred_raw = finalize_imputation(Xt_in_raw, standardize_invert(pred_z, client_mu, client_sigma))
+
             else:
                 raise ValueError(f"Unknown federated method: {m}")
 
             rows.append({
                 "client_id": cid,
                 "method": m,
-                "rmse_scaled": rmse_on_mask(Xt, pred, mask),
+                "rmse_raw": rmse_on_mask(Xt_raw, pred_raw, mask),
             })
 
     return rows
 
+
+# -------------------------
+# Main
+# -------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -522,8 +755,9 @@ def main():
 
     ap.add_argument(
         "--methods",
-        default="mice,dae,gain,transformer,fed_mean,fed_dae,fed_transformer",
-        help="Comma-separated. Local: mice,dae,gain,transformer. Federated: fed_mean,fed_dae,fed_transformer"
+        default="mice,vfl_knn,dae,gain,transformer,fed_mean,fed_dae,fed_transformer,fed_featgen",
+        help="Comma-separated. Local: mice,vfl_knn,dae,gain,transformer. "
+             "Federated: fed_mean,fed_dae,fed_transformer,fed_featgen"
     )
 
     ap.add_argument("--corruption-prob", type=float, default=0.6)
@@ -551,11 +785,11 @@ def main():
         results = run_one_client_local(
             pth, args.test_npz, local_methods, args.corruption_prob, args.seed + cid, device
         )
-        for name, rmse_scaled in results:
+        for name, rmse_raw in results:
             rows.append({
                 "client_id": cid,
                 "method": name,
-                "rmse_scaled": rmse_scaled,
+                "rmse_raw": rmse_raw,
             })
 
     # ----- Federated baselines -----
@@ -575,7 +809,7 @@ def main():
     ensure_dir(args.out_csv)
     df.to_csv(args.out_csv, index=False)
 
-    print(df.groupby("method")["rmse_scaled"].agg(["mean", "std", "count"]).sort_values("mean"))
+    print(df.groupby("method")["rmse_raw"].agg(["mean", "std", "count"]).sort_values("mean"))
 
 if __name__ == "__main__":
     main()

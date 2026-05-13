@@ -1,28 +1,8 @@
-# run_client.py  (UPDATED for SECOM + edge_weight + deterministic eval + better training)
-#
-# What’s new vs your current client:
-# 1) Loads edge_index + edge_weight from secom_fedhf/global_graph.npz
-# 2) Uses deterministic evaluation masks (stable RMSE curve)
-# 3) Uses stronger block-masking during training (better learning signal)
-# 4) Auto-detects feature dimension F from the client NPZ (no mismatch)
-# 5) Saves per-client per-round metrics to CSV: results/client_{id}.csv
-#
-# Run:
-#   python run_client.py --client-id 0 --data-dir secom_fedhf/clients --graph-path secom_fedhf/global_graph.npz
-#   python run_client.py --client-id 1 --data-dir secom_fedhf/clients --graph-path secom_fedhf/global_graph.npz
-#
-# Notes:
-# - Requires your FedHFImputer.forward(x, obs, avail, edge_index, edge_weight)
-# - Works with Flower start_numpy_client (deprecated warnings are harmless)
-
 from __future__ import annotations
-
 import argparse
 import csv
 import math
 import os
-from typing import Tuple
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
@@ -32,9 +12,7 @@ from fedhf.model import FedHFImputer
 from fedhf.utils import ndarrays_from_state_dict, load_state_dict_from_ndarrays
 
 
-# ----------------------------
-# Dataset
-# ----------------------------
+
 class NPZClientDataset(Dataset):
     """Loads X (with NaNs) + availability_mask from .npz; returns (x, obs, avail)."""
 
@@ -54,9 +32,7 @@ class NPZClientDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(obs), torch.from_numpy(self.avail)
 
 
-# ----------------------------
-# Masking + losses
-# ----------------------------
+
 def make_block_corruption(
     obs: torch.Tensor,
     avail: torch.Tensor,
@@ -73,21 +49,17 @@ def make_block_corruption(
     """
     B, F = obs.shape
     device = obs.device
-
-    # features that exist on this client
     if avail.ndim == 1:
         avail_f = avail.bool()
     else:
         avail_f = (avail[0] > 0).bool()
 
-    # candidate features to corrupt: available and at least some observed in batch
     obs_any = (obs > 0).any(dim=0)
     candidates = (avail_f & obs_any).nonzero(as_tuple=False).flatten()
     if candidates.numel() == 0:
         return torch.zeros((B, F), device=device, dtype=torch.bool)
 
     m = max(1, int(math.ceil(block_frac * candidates.numel())))
-    # sample m feature indices
     perm = candidates[torch.randperm(candidates.numel(), generator=rng, device=device)]
     chosen = perm[:m]
 
@@ -95,7 +67,7 @@ def make_block_corruption(
     corrupt[:, chosen] = True
 
     eligible = (obs > 0)
-    corrupt = corrupt & eligible  # only corrupt observed positions (and available by construction)
+    corrupt = corrupt & eligible
     return corrupt
 
 
@@ -154,9 +126,9 @@ def eval_rmse_deterministic(
     return math.sqrt(se_sum / n_sum) if n_sum > 0 else 0.0
 
 
-# ----------------------------
+
 # Client
-# ----------------------------
+
 class FedHFClient(fl.client.NumPyClient):
     def __init__(
         self,
@@ -179,7 +151,6 @@ class FedHFClient(fl.client.NumPyClient):
 
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-        # CSV logging
         self.results_csv = results_csv
         os.makedirs(os.path.dirname(results_csv), exist_ok=True)
         if not os.path.exists(results_csv):
@@ -198,15 +169,12 @@ class FedHFClient(fl.client.NumPyClient):
         lr = float(config.get("lr", 1e-3))
         local_epochs = int(config.get("local_epochs", 1))
 
-        # Instead of IID corruption_prob, we do block masking:
         block_frac = float(config.get("block_frac", 0.25))  # 25% of available features per batch
-        # (you can tune: 0.2..0.5)
 
         for g in self.opt.param_groups:
             g["lr"] = lr
 
         gmask = torch.Generator(device=self.device)
-        # make training stochastic but reproducible-ish per round
         gmask.manual_seed(10_000 + self.client_id * 1000 + server_round)
 
         last_loss = 0.0
@@ -215,8 +183,6 @@ class FedHFClient(fl.client.NumPyClient):
                 x = x.to(self.device)
                 obs = obs.to(self.device)
                 avail = avail.to(self.device)
-
-                # build corruption mask (block-based)
                 corrupt = make_block_corruption(obs, avail[0] if avail.ndim == 2 else avail, block_frac, gmask)
 
                 x_in = x.clone()
@@ -234,7 +200,7 @@ class FedHFClient(fl.client.NumPyClient):
 
                 last_loss = float(loss.detach().cpu().item())
 
-        # Optional: compute deterministic val RMSE locally each round (cheap if max_batches small)
+
         val_rmse = eval_rmse_deterministic(
             self.model,
             self.val_loader,
@@ -242,7 +208,7 @@ class FedHFClient(fl.client.NumPyClient):
             self.edge_index,
             self.edge_weight,
             corruption_prob=float(config.get("eval_corruption_prob", 0.6)),
-            seed=12345,  # fixed -> stable curve
+            seed=12345,
             max_batches=30,
         )
 
@@ -256,7 +222,6 @@ class FedHFClient(fl.client.NumPyClient):
         load_state_dict_from_ndarrays(self.model, parameters)
         server_round = int(config.get("server_round", 0))
 
-        # Deterministic eval; if you want slight variation per round, use seed=12345+server_round
         rmse = eval_rmse_deterministic(
             self.model,
             self.val_loader,
@@ -264,21 +229,19 @@ class FedHFClient(fl.client.NumPyClient):
             self.edge_index,
             self.edge_weight,
             corruption_prob=float(config.get("corruption_prob", 0.6)),
-            seed=12345,  # stable
+            seed=12345,
             max_batches=80,
         )
 
         return float(rmse), len(self.val_loader.dataset), {"rmse": float(rmse)}
 
 
-# ----------------------------
-# Main
-# ----------------------------
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client-id", type=int, required=True)
     parser.add_argument("--data-dir", type=str, required=True, help="Directory containing client_*.npz")
-    parser.add_argument("--graph-path", type=str, default="secom_fedhf/global_graph.npz")
+    parser.add_argument("--graph-path", type=str, default="physionet_fedhf/global_graph.npz")
     parser.add_argument("--server", type=str, default="127.0.0.1:8080")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--d-model", type=int, default=128)
@@ -306,7 +269,6 @@ def main():
     edge_index = torch.tensor(g["edge_index"], dtype=torch.long, device=device)
     edge_weight = torch.tensor(g["edge_weight"], dtype=torch.float32, device=device)
 
-    # Build model with correct F (from dataset)
     model = FedHFImputer(n_features=ds.F, d_model=args.d_model, n_layers=args.n_layers).to(device)
 
     results_csv = os.path.join("results", f"client_{args.client_id}.csv")
@@ -322,7 +284,6 @@ def main():
         results_csv=results_csv,
     )
 
-    # Deprecated warnings are fine; this still runs.
     fl.client.start_numpy_client(server_address=args.server, client=client)
 
 
