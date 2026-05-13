@@ -1,26 +1,3 @@
-# prepare_secom_fedhf.py
-# ---------------------------------------------------------
-# Robust SECOM preparation (no ucimlrepo), with QUALITY FILTERS:
-#  - Downloads secom.data (and optionally secom.labels) unless --offline
-#  - Drops near-constant features (variance filter)
-#  - Optionally drops very-missing features (missing-rate filter)
-#  - Train/test split (avoid leakage in correlation graph)
-#  - Standardize per-feature using TRAIN observed values only
-#  - Build GLOBAL weighted correlation graph on TRAIN
-#  - Create FL clients with heterogeneous schemas (availability_mask)
-#  - Saves mappings for kept features
-#
-# Outputs (out_dir):
-#   global_graph.npz: edge_index, edge_weight, mu, sd, kept_feature_idx
-#   clients/client_{i}.npz: X, availability_mask
-#   test.npz: X, obs
-#
-# Usage:
-#   python prepare_secom_fedhf.py
-#   python prepare_secom_fedhf.py --offline --raw-dir raw_secom
-#   python prepare_secom_fedhf.py --offline --raw-dir raw_secom --keep-ratio 0.8 --graph-k 8
-# ---------------------------------------------------------
-
 from __future__ import annotations
 import os
 import argparse
@@ -132,7 +109,6 @@ def build_global_corr_graph(X_train_std: np.ndarray, obs_train: np.ndarray, k: i
     edges = []
     weights = []
     for i in range(F):
-        # top-k by abs corr
         idx = np.argsort(-np.abs(C[i]))[:k]
         for j in idx:
             if i == j:
@@ -146,7 +122,6 @@ def build_global_corr_graph(X_train_std: np.ndarray, obs_train: np.ndarray, k: i
     edge_index = np.array(edges, dtype=np.int64).T if edges else np.zeros((2, 0), dtype=np.int64)
     edge_weight = np.array(weights, dtype=np.float32) if weights else np.zeros((0,), dtype=np.float32)
 
-    # normalize to [0,1]
     if edge_weight.size > 0:
         m = float(edge_weight.max())
         if m > 0:
@@ -202,7 +177,6 @@ def main():
     p.add_argument("--graph-k", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
 
-    # Quality filters
     p.add_argument("--min-var", type=float, default=1e-6, help="Variance threshold on observed entries.")
     p.add_argument("--min-obs", type=int, default=10, help="Min observed count needed to compute variance.")
     p.add_argument("--max-missing", type=float, default=0.95, help="Drop features with missing rate > this.")
@@ -217,7 +191,6 @@ def main():
 
     if not args.offline:
         download_if_missing(UCI_DATA_URL, data_path)
-        # labels are optional; attempt download but don't fail if blocked
         try:
             download_if_missing(UCI_LABELS_URL, labels_path)
         except Exception as ex:
@@ -234,7 +207,6 @@ def main():
     N0, F0 = X.shape
     print(f"[INFO] Loaded raw SECOM: N={N0}, F={F0}")
 
-    # --- Quality filters ---
     keep_var, var, obs_count = variance_filter(X, min_var=args.min_var, min_obs=args.min_obs)
     keep_miss, miss_rate = missing_rate_filter(X, max_missing=args.max_missing)
     keep = keep_var & keep_miss
@@ -248,7 +220,6 @@ def main():
     print(f"[INFO] Missing-rate filter kept: {int(keep_miss.sum())}/{F0}")
     print(f"[INFO] Combined kept: {F}/{F0}")
 
-    # --- Train/test split ---
     rng = np.random.default_rng(args.seed)
     perm = rng.permutation(N)
     split = int(0.8 * N)
@@ -260,11 +231,9 @@ def main():
     X_test = X[test_idx]
     obs_test = obs[test_idx]
 
-    # --- Standardize using TRAIN observed stats ---
     X_train_std, mu, sd = zscore_per_feature_train(X_train, obs_train)
     X_test_std = ((X_test - mu[None, :]) / sd[None, :]).astype(np.float32)
 
-    # --- Build global correlation graph on TRAIN ---
     edge_index, edge_weight = build_global_corr_graph(X_train_std, obs_train, k=args.graph_k)
 
     np.savez_compressed(
@@ -276,7 +245,6 @@ def main():
         kept_feature_idx=kept_feature_idx,
     )
 
-    # --- Create clients from TRAIN only ---
     clients = make_clients(
         X_train_std,
         n_clients=args.n_clients,
